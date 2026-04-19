@@ -1,3 +1,25 @@
+# ===== Project-specific =====
+
+# Training data (parquet, arrow, stats)
+data/
+
+# Model checkpoints
+checkpoints/
+*.pt
+
+# Training & pipeline logs
+logs/
+ray_results/
+
+# Backup files
+*.bak
+
+# RAG app artifacts
+super/vectorstore/
+super/documents/
+
+# ===== Python general =====
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

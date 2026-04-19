@@ -1,0 +1,14 @@
+# LLM pretraining pipeline (01–04) + API scoring (05)
+torch>=2.2
+transformers>=4.38
+datasets>=2.16
+pyarrow>=14
+tqdm>=4.66
+bitsandbytes>=0.43
+
+# 05_score_api.py
+openai>=1.0
+python-dotenv>=1.0
+
+# super/ RAG stack (optional)
+# fastapi uvicorn chromadb sentence-transformers — add if you use super/

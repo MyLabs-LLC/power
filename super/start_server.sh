@@ -11,6 +11,7 @@
 #   ./start_server.sh --ctx-size 1048576 # Full 1M native window (may OOM on startup)
 #   ./start_server.sh --autostart on   # Enable auto-start on boot (systemd user service)
 #   ./start_server.sh --autostart off  # Disable auto-start on boot
+#   ./stop_server.sh                   # Stop the React UI and llama-server
 #
 # Compression tradeoff: turbo4 (3.8x, safest) < turbo3 (5.1x, balanced) < turbo2 (6.4x, aggressive)
 # Max context uses the most aggressive V-cache compression while keeping q8_0 K-cache for
@@ -27,6 +28,7 @@ shopt -s nullglob
 
 # ── Defaults (max-context TurboQuant) ────────────────────────────────────────
 PORT=8001
+UI_PORT=7860
 HOST=0.0.0.0
 N_GPU_LAYERS=99
 TENSOR_SPLIT="0.5,0.5"
@@ -54,6 +56,13 @@ MODEL_DIR="$HOME/models/nemotron-3-nano"
 BASELINE=false
 SAFE=false
 SERVICE_NAME="llama-server"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_DIR="$APP_DIR/.run"
+LOG_DIR="$APP_DIR/logs"
+LLAMA_PID_FILE="$RUN_DIR/llama-server.pid"
+UI_PID_FILE="$RUN_DIR/react-ui.pid"
+LLAMA_LOG="$LOG_DIR/llama-server.log"
+UI_LOG="$LOG_DIR/react-ui.log"
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -66,6 +75,8 @@ while [[ $# -gt 0 ]]; do
             CTX_SIZE="$2"; shift 2 ;;
         --port)
             PORT="$2"; shift 2 ;;
+        --ui-port)
+            UI_PORT="$2"; shift 2 ;;
         --tensor-split)
             TENSOR_SPLIT="$2"; shift 2 ;;
         --batch-size)
@@ -139,21 +150,20 @@ if [[ ! -x "$SERVER" ]]; then
     exit 1
 fi
 
-# ── Kill existing server on the same port ─────────────────────────────────────
-EXISTING_PID=$(lsof -ti:"$PORT" 2>/dev/null || true)
-if [[ -n "$EXISTING_PID" ]]; then
-    echo "Stopping existing server on port $PORT (PID: $EXISTING_PID)..."
-    kill "$EXISTING_PID" 2>/dev/null || true
-    sleep 2
-fi
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+# ── Stop any previous project processes ──────────────────────────────────────
+"$APP_DIR/stop_server.sh" --quiet --llm-port "$PORT" --ui-port "$UI_PORT" || true
 
 # ── Launch llama-server in background ────────────────────────────────────────
 echo "Model:  $MODEL_PATH"
 echo "Server: $SERVER"
 echo "Port:   $PORT"
+echo "UI:     http://localhost:$UI_PORT"
+echo "Logs:   $LOG_DIR"
 echo ""
 
-"$SERVER" \
+setsid nohup "$SERVER" \
     --model "$MODEL_PATH" \
     --alias "nemotron-3-nano" \
     --n-gpu-layers "$N_GPU_LAYERS" \
@@ -166,39 +176,111 @@ echo ""
     -ctk "$CACHE_TYPE_K" \
     -ctv "$CACHE_TYPE_V" \
     --port "$PORT" \
-    --host "$HOST" &
+    --host "$HOST" >"$LLAMA_LOG" 2>&1 &
 SERVER_PID=$!
+echo "$SERVER_PID" > "$LLAMA_PID_FILE"
+UI_PID=""
 
 cleanup() {
     echo ""
-    echo "Shutting down llama-server (PID: $SERVER_PID)..."
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
+    "$APP_DIR/stop_server.sh" --quiet --llm-port "$PORT" --ui-port "$UI_PORT" || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup INT TERM
 
 # ── Wait for llama-server health ─────────────────────────────────────────────
 echo "Waiting for llama-server to come up on :$PORT..."
 for i in {1..120}; do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "ERROR: llama-server exited before becoming healthy."
-        exit 1
-    fi
     if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
+        LISTENER_PID=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
+        if [[ -n "$LISTENER_PID" ]]; then
+            SERVER_PID="$LISTENER_PID"
+            echo "$SERVER_PID" > "$LLAMA_PID_FILE"
+        fi
         echo "llama-server is ready."
         break
     fi
+
+    LISTENER_PID=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
+    if ! kill -0 "$SERVER_PID" 2>/dev/null && [[ -z "$LISTENER_PID" ]]; then
+        echo "ERROR: llama-server exited and nothing is listening on :$PORT."
+        echo "Last llama-server log lines:"
+        tail -80 "$LLAMA_LOG" || true
+        cleanup
+        exit 1
+    fi
+
+    if [[ -n "$LISTENER_PID" && "$LISTENER_PID" != "$SERVER_PID" ]]; then
+        SERVER_PID="$LISTENER_PID"
+        echo "$SERVER_PID" > "$LLAMA_PID_FILE"
+    fi
+
     sleep 2
 done
 
-# ── Activate rag conda env and launch Gradio app ─────────────────────────────
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
+    echo "ERROR: llama-server did not become healthy before timeout."
+    echo "Last llama-server log lines:"
+    tail -80 "$LLAMA_LOG" || true
+    cleanup
+    exit 1
+fi
+
+# ── Activate rag conda env and launch React/FastAPI app ──────────────────────
 CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
 # shellcheck disable=SC1091
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate rag
 
 echo ""
-echo "Starting Gradio app (http://localhost:7860)..."
+echo "Starting React app (http://localhost:$UI_PORT)..."
 cd "$APP_DIR"
-python app.py
+setsid nohup env MYLABS_UI_PORT="$UI_PORT" python app.py >"$UI_LOG" 2>&1 &
+UI_PID=$!
+echo "$UI_PID" > "$UI_PID_FILE"
+
+echo "Waiting for React/FastAPI app to come up on :$UI_PORT..."
+for i in {1..60}; do
+    if curl -sf "http://localhost:$UI_PORT/api/health" >/dev/null 2>&1; then
+        LISTENER_PID=$(lsof -tiTCP:"$UI_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
+        if [[ -n "$LISTENER_PID" ]]; then
+            UI_PID="$LISTENER_PID"
+            echo "$UI_PID" > "$UI_PID_FILE"
+        fi
+        echo "React/FastAPI app is ready."
+        break
+    fi
+
+    LISTENER_PID=$(lsof -tiTCP:"$UI_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
+    if ! kill -0 "$UI_PID" 2>/dev/null && [[ -z "$LISTENER_PID" ]]; then
+        echo "ERROR: React/FastAPI app exited and nothing is listening on :$UI_PORT."
+        echo "Last UI log lines:"
+        tail -80 "$UI_LOG" || true
+        cleanup
+        exit 1
+    fi
+
+    if [[ -n "$LISTENER_PID" && "$LISTENER_PID" != "$UI_PID" ]]; then
+        UI_PID="$LISTENER_PID"
+        echo "$UI_PID" > "$UI_PID_FILE"
+    fi
+
+    sleep 2
+done
+
+if ! curl -sf "http://localhost:$UI_PORT/api/health" >/dev/null 2>&1; then
+    echo "ERROR: React/FastAPI app did not become healthy before timeout."
+    echo "Last UI log lines:"
+    tail -80 "$UI_LOG" || true
+    cleanup
+    exit 1
+fi
+
+echo ""
+echo "MyLabs Studio is running."
+echo "  UI:          http://localhost:$UI_PORT"
+echo "  LLM health:  http://localhost:$PORT/health"
+echo "  UI log:      $UI_LOG"
+echo "  LLM log:     $LLAMA_LOG"
+echo "Run ./stop_server.sh to stop everything."
+
+trap - INT TERM

@@ -3,20 +3,20 @@
 > **Project root:** `/home/lence/power/super/`
 > **Conda env:** `rag` (Python 3.13) — activate with `conda activate rag`
 > **LLM server:** `llama-server` (TurboQuant fork) on `:8001`
-> **Chat UI:** Gradio "MyLabs Studio" on `:7860`
+> **Chat UI:** React/FastAPI "MyLabs Studio" on `:7860`
 
 ---
 
 ## 1. Orientation (read first if resuming cold)
 
-Local RAG stack running **NVIDIA Nemotron-3-Nano-30B-A3B** (Unsloth Q8_0 GGUF, ~34 GB) split across **2× RTX 3090** (48 GB VRAM total). Documents are chunked, embedded with BGE-base on CPU, stored in **per-dataset ChromaDB collections**, and retrieved with cross-encoder reranking. The chat UI is a Gradio app themed after **Unsloth Studio** (MyLabs-LLC fork, AGPL-3.0) with **MyLabs LLC branding**.
+Local RAG stack running **NVIDIA Nemotron-3-Nano-30B-A3B** (Unsloth Q8_0 GGUF, ~34 GB) split across **2× RTX 3090** (48 GB VRAM total). Documents are chunked, embedded with BGE-base on CPU, stored in **per-dataset ChromaDB collections**, and retrieved with cross-encoder reranking. The chat UI is now a React single-page app served by FastAPI with **MyLabs LLC branding**.
 
 The llama.cpp server is a [TheTom/llama-cpp-turboquant fork](https://github.com/TheTom/llama-cpp-turboquant) that adds `turbo2/3/4` KV-cache compression types. This is what makes giant context windows fit on 24 GB consumer GPUs.
 
 ### 30-second mental model
 
 ```
-Browser :7860  ──►  Gradio app (app.py in rag env)
+Browser :7860  ──►  React SPA + FastAPI (app.py in rag env)
                          │
                          ├─► ChromaDB (./vectorstore/, per-dataset collections)
                          │   embed: BAAI/bge-base-en-v1.5 (CPU)
@@ -30,27 +30,29 @@ Browser :7860  ──►  Gradio app (app.py in rag env)
 
 ---
 
-## 2. Current state of the build (last touched 2026-04-19)
+## 2. Current state of the build (last touched 2026-04-28)
 
 - ✅ llama.cpp turboquant fork built at `~/llama.cpp-turboquant/build/bin/llama-server`
 - ✅ Mainline llama.cpp fallback at `~/llama.cpp.mainline/llama-server`
 - ✅ Q8_0 GGUF downloaded to `~/models/nemotron-3-nano/`
-- ✅ `rag` conda env with openai, chromadb, sentence-transformers, gradio 6.11, pypdf, python-docx, langchain-text-splitters
-- ✅ `start_server.sh` launches llama-server **and** the Gradio app in one command (conda-activates `rag`, waits for `/health`, traps Ctrl-C to shut down both)
-- ✅ `app.py` rewritten with Unsloth Studio visual design + MyLabs LLC branding (see §10)
-- ✅ `static/mylabs-logo.png` = MyLabs LLC avatar (256×256 JPEG), used as header logo, chatbot avatar, and favicon
+- ✅ `rag` conda env with openai, chromadb, sentence-transformers, fastapi, uvicorn, python-multipart, pypdf, python-docx, langchain-text-splitters
+- ✅ `start_server.sh` launches llama-server **and** the React/FastAPI app in one command (conda-activates `rag`, waits for `/health`, traps Ctrl-C to shut down both)
+- ✅ `app.py` exposes API endpoints and SSE streaming for chat, ingestion, reindexing, and arXiv discovery
+- ✅ `web/` contains the React SPA; `static/mylabs-logo.png` is used as header logo and favicon
 - ✅ Default ctx reduced from 1M to **256K** to avoid pipeline-parallel compute-buffer OOM on startup (pass `--ctx-size 1048576` for the full native window if VRAM allows)
 
 ### Implementation files (all live in project root)
 
 | File | Role |
 |---|---|
-| `app.py` | Gradio UI — chat, dataset CRUD, paper discovery, pipeline stats |
+| `app.py` | FastAPI backend — React shell, chat SSE, dataset CRUD, paper discovery, pipeline stats |
+| `web/` | React single-page app assets served on `:7860` |
 | `rag.py` | `RAGEngine` class — retrieve → rerank → generate (streaming) |
 | `ingest.py` | Document ingestion — CLI + `ingest_dataset` / `ingest_dataset_streaming` |
 | `discover.py` | arXiv paper search + download for auto-ingestion |
 | `config.py` | Shared settings (URLs, models, chunking, retrieval K, prompts) |
-| `start_server.sh` | One-command launcher: llama-server + Gradio (with health check & trap cleanup) |
+| `start_server.sh` | One-command launcher: llama-server + React/FastAPI app (with health check, PID files, logs, trap cleanup) |
+| `stop_server.sh` | Stops both services by PID file and port fallback |
 | `test_rag.py` | Smoke test for the RAG pipeline |
 | `03_collect_data.py` | (related to the parent training project, not RAG) |
 | `static/mylabs-logo.png` | Branding asset |
@@ -77,7 +79,15 @@ That script:
 4. Polls `http://localhost:8001/health` for up to 4 min; bails if the server dies.
 5. Sources `conda.sh`, activates the `rag` env, runs `python app.py` in the foreground.
 
-Ctrl-C shuts down **both** the Gradio app and llama-server cleanly.
+Ctrl-C shuts down **both** the React/FastAPI app and llama-server cleanly.
+
+To stop a background or stuck launch:
+
+```bash
+./stop_server.sh
+```
+
+Runtime files are written under `.run/`; logs are written under `logs/`.
 
 ### Variants
 
@@ -135,12 +145,14 @@ python test_rag.py                       # RAG pipeline smoke test
 ```
 /home/lence/power/super/
 ├── CLAUDE.md              # this file
-├── start_server.sh        # launcher (llama-server + Gradio, conda + health check + trap)
+├── start_server.sh        # launcher (llama-server + React/FastAPI, PID files + health checks)
+├── stop_server.sh         # stops UI + llama-server by PID/port
 ├── config.py              # URLs, model names, chunking/retrieval params, system prompts
 ├── rag.py                 # RAGEngine: switch_dataset, retrieve, generate_stream(_direct)
 ├── ingest.py              # ingest_dataset, ingest_dataset_streaming, CLI entry
 ├── discover.py            # arXiv search + download; title_to_filename helper
-├── app.py                 # Gradio UI (MyLabs Studio design system)
+├── app.py                 # FastAPI API + React static serving
+├── web/                   # React SPA assets
 ├── test_rag.py            # smoke test
 ├── static/
 │   └── mylabs-logo.png    # MyLabs LLC branding (256×256 JPEG)
@@ -157,24 +169,19 @@ Adjacent: `/home/lence/power/CLAUDE.md` covers the **pretraining pipeline** (unr
 
 These are things that cost time to debug in earlier sessions. Respect them.
 
-### 5.1 Gradio 6.11 API differences
+### 5.1 React/FastAPI UI shape
 
-Gradio 6 is the installed version. It differs from Gradio 4/5 in ways our code hits:
+The browser loads `web/index.html`, `web/app.js`, and `web/styles.css`. The React app has no local build step; it uses production React UMD from a CDN. Backend streaming uses server-sent events from `POST /api/chat/stream`, `POST /api/datasets/{name}/upload`, `POST /api/datasets/{name}/reindex`, and `POST /api/discover`.
 
-- **`gr.Chatbot` does NOT accept `type="messages"`.** The messages format is the default in v6 — passing `type=` raises `TypeError`. Our chatbot uses the messages dict format (`{"role": "user"|"assistant", "content": str}`) implicitly.
-- **`theme` and `css` must be passed to `.launch()`, NOT `gr.Blocks()` constructor.** Gradio 6.0 moved these. `gr.Blocks(theme=..., css=...)` emits a deprecation warning and may fail.
-- **`gr.Chatbot(avatar_images=...)` must be a file path, not a data URI.** Gradio validates the arg via `Path.exists()` which `OSError: [Errno 36] File name too long`s on base64 data URIs. Pass `LOGO_PATH` (a filesystem path).
-- **`allowed_paths=[...]` in `.launch()` is required** to serve files from `static/` — we use it so the favicon resolves.
+### 5.2 Dataset names are normalized
 
-### 5.2 The dataset dropdown must tolerate empty choices
-
-`gr.Dropdown(choices=get_dataset_choices(), allow_custom_value=True)` — without `allow_custom_value=True`, if `./documents/` is empty on first launch the dropdown's `.change` event fires with value `""` against choices `[]` and Gradio throws `Value:  is not in the list of choices: []`. The `allow_custom_value=True` bypasses that validation.
+New dataset names are normalized in `app.py` with `clean_dataset_name()`. This prevents path traversal and keeps folder names compatible with the `rag_<dataset>` Chroma collection naming scheme.
 
 ### 5.3 Default context is 256K, not 1M
 
 The model's **native training window is 1,048,576 tokens**, but on startup llama.cpp first tries to allocate a **pipeline-parallel compute buffer** (~9.3 GiB at 1M), which OOMs on the 3090s after the Q8_0 weights load. It auto-retries without pipeline parallelism and succeeds with smaller buffers (~3 GB + ~1 GB + ~2 GB host) — so 1M *works* but boots with noisy retry logs. **Default is now 256K** in `start_server.sh`. Pass `--ctx-size 1048576` to opt into 1M.
 
-### 5.4 The Gradio app takes ~10-15s to start
+### 5.4 The UI backend takes ~10-15s to start
 
 It loads BGE-base (embed) + BGE-reranker-base (rerank) on CPU at import time, both of which log `UNEXPECTED embeddings.position_ids` warnings. **These are benign** (sentence-transformers ships a `position_ids` tensor the newer HF architecture doesn't use) — do not "fix" them.
 
@@ -184,11 +191,11 @@ After deleting the active dataset, `engine.collection` is set to `None`. The cha
 
 ### 5.6 Three chat modes
 
-`mode_selector` (pill-tab Radio) has three values: **"RAG Only"**, **"RAG + Model"**, **"Model Only"**. Only the first two retrieve from the vector store; Model Only bypasses retrieval entirely and calls `engine.generate_stream_direct`. Don't flatten these into a boolean.
+The mode selector has three values: **"RAG Only"**, **"RAG + Model"**, **"Model Only"**. Only the first two retrieve from the vector store; Model Only bypasses retrieval entirely and calls `engine.generate_stream_direct`. Don't flatten these into a boolean.
 
-### 5.7 Chat history is stored in `gr.State`
+### 5.7 Chat history is browser-local
 
-`all_chats` is a list of `{"name": str, "messages": list[dict]}`; `current_idx` indexes into it. The left-column Radio shows `"<idx+1>. <name>"` labels. Chat name auto-derives from the first 6 words of the first user message.
+The React app stores conversations in `localStorage` under `mylabs-studio-chats-v2`. Chat name auto-derives from the first 6 words of the first user message.
 
 ### 5.8 No mainline llama.cpp at `/usr/local` — use the prebuilt binaries
 
@@ -197,7 +204,7 @@ After deleting the active dataset, `engine.collection` is set to `None`. The cha
 
 ### 5.9 Port already in use errors
 
-If `./start_server.sh` fails with "port in use", run `lsof -ti:7860 :8001 | xargs -r kill` and retry. The launcher auto-frees 8001 at the top, but 7860 is the Gradio port and relies on a previous clean shutdown.
+If `./start_server.sh` fails with "port in use", run `lsof -ti:7860 :8001 | xargs -r kill` and retry. The launcher auto-frees 8001 at the top; 7860 is owned by `python app.py`.
 
 ---
 
@@ -205,7 +212,7 @@ If `./start_server.sh` fails with "port in use", run `lsof -ti:7860 :8001 | xarg
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│           MyLabs Studio — Gradio UI (:7860)          │
+│       MyLabs Studio — React + FastAPI (:7860)        │
 │   chat history │ chatbot + composer │ dataset/arXiv  │
 ├─────────────────────────────────────────────────────┤
 │                  RAG Orchestrator                    │
@@ -290,7 +297,7 @@ HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
 conda create -n rag python=3.13 -y
 conda activate rag
 pip install uv
-uv pip install openai chromadb sentence-transformers gradio pypdf \
+uv pip install openai chromadb sentence-transformers fastapi uvicorn python-multipart pypdf \
     python-docx tiktoken langchain langchain-community langchain-text-splitters
 ```
 
@@ -379,31 +386,28 @@ curl http://localhost:8001/v1/chat/completions \
 
 ## 10. UI design system — MyLabs Studio
 
-The UI is a Gradio Blocks app themed to match **Unsloth Studio** (React/Tailwind in its native form at [MyLabs-LLC/unsloth](https://github.com/MyLabs-LLC/unsloth), AGPL-3.0). We port only the **visual language** (design tokens, typography, layout), not the code.
+The UI is a React single-page app served by FastAPI from `app.py`. It keeps the MyLabs/Unsloth-inspired visual language but removes Gradio runtime overhead and uses server-sent events for low-latency streaming.
 
 ### Branding
 
-- **Header logo & favicon:** `static/mylabs-logo.png` (MyLabs LLC avatar). Embedded as base64 data URI in the header HTML; passed as a file path to `gr.Chatbot(avatar_images=...)` (see §5.1).
-- **Header text:** "MyLabs Studio — Nemotron-3-Nano RAG · 2× RTX 3090"
-- **Status pill:** green "Online" indicator (pulses with primary color glow)
-- **Context chip:** shows `Q8_0 · <N>K ctx` in the header
+- **Header logo & favicon:** `static/mylabs-logo.png` (MyLabs LLC avatar).
+- **Header text:** "MyLabs Studio — Nemotron-3-Nano RAG · React SPA"
+- **Status pill:** green "Online" indicator, amber "Working" while streaming or ingesting
+- **Context chip:** shows `<N>K ctx` in the header
 
-### Design tokens (in `app.py` CSS block)
+### Design tokens (in `web/styles.css`)
 
 ```css
---mylabs-primary:     oklch(0.6929 0.1396 166.5513);  /* mint-teal — Unsloth brand */
---mylabs-primary-soft: oklch(0.6929 0.1396 166.5513 / 0.15);
---mylabs-bg:          oklch(0.24 0 0);
---mylabs-card:        oklch(0.28 0 0);
---mylabs-sidebar:     oklch(0.21 0 0);
---mylabs-border:      oklch(0.38 0 0);
---mylabs-muted:       oklch(0.33 0 0);
---mylabs-muted-fg:    oklch(0.72 0 0);
---mylabs-radius:      14px;
---mylabs-radius-lg:   18px;
+--bg: #141513;
+--panel: #1e211d;
+--panel-2: #252a24;
+--line: #3d463b;
+--text: #f5f3ea;
+--muted: #a9b0a2;
+--green: #41d196;
 ```
 
-Fonts loaded from Google Fonts: **Inter** (body), **Space Grotesk** (headings), **JetBrains Mono** (code/stats).
+Fonts loaded from Google Fonts: **Manrope** (body/headings) and **JetBrains Mono** (stats/logs).
 
 ### Layout
 
@@ -413,7 +417,7 @@ Fonts loaded from Google Fonts: **Inter** (body), **Space Grotesk** (headings), 
 │  LEFT          │      MAIN                    │  RIGHT          │
 │  (scale 1)     │      (scale 4)               │  (scale 2)      │
 │                │                              │                 │
-│  + New Chat    │  Chatbot (560px, markdown)   │  Dataset        │
+│  + New Chat    │  Streaming chat transcript   │  Dataset        │
 │  Conversations │                              │    dropdown     │
 │  · chat 1      │  Mode pills: RAG / R+M / M   │    info box     │
 │  · chat 2      │                              │  ▸ New Dataset  │
@@ -424,17 +428,13 @@ Fonts loaded from Google Fonts: **Inter** (body), **Space Grotesk** (headings), 
 └────────────────┴──────────────────────────────┴─────────────────┘
 ```
 
-### Gradio theme
+### API endpoints
 
-```python
-THEME = gr.themes.Base(
-    primary_hue=gr.themes.colors.emerald,
-    font=[gr.themes.GoogleFont("Inter"), ...],
-    radius_size=gr.themes.sizes.radius_lg,
-).set(...)  # OKLCH overrides match the design tokens above
-```
-
-Theme + CSS are passed to `.launch()`, not `gr.Blocks()` (see §5.1).
+- `GET /api/bootstrap` — initial app state, datasets, active dataset, UI metadata.
+- `POST /api/chat/stream` — SSE chat streaming with pipeline stats and sources.
+- `POST /api/datasets`, `POST /api/datasets/select`, `DELETE /api/datasets/{name}` — dataset CRUD.
+- `POST /api/datasets/{name}/upload`, `POST /api/datasets/{name}/reindex` — SSE ingestion progress.
+- `POST /api/discover` — SSE arXiv discovery, download, and ingestion progress.
 
 ---
 
@@ -450,8 +450,8 @@ Theme + CSS are passed to `.launch()`, not `gr.Blocks()` (see §5.1).
 | Cross-dataset bleed | Datasets are collection-isolated — check which `rag_<name>` the UI is pointed at. |
 | Want full 1M ctx | `./start_server.sh --ctx-size 1048576` (accepts the startup OOM-retry noise). |
 | TurboQuant quality issues | `-ctv turbo4` (3.8×, safest) or `--baseline`. |
-| Gradio `Value:  is not in the list of choices: []` | Add `allow_custom_value=True` to the offending dropdown (see §5.2). |
-| Port 7860 in use | `lsof -ti:7860 | xargs -r kill` then re-run `./start_server.sh`. |
+| React UI does not load | Check browser network access to React CDN or vendor React locally in `web/`. |
+| Port 7860 or 8001 in use | `./stop_server.sh` then re-run `./start_server.sh`. |
 
 ---
 
@@ -478,9 +478,8 @@ for c in db.list_collections():
 
 ## 13. History of recent changes (this session)
 
-- **app.py**: full UI rewrite — MyLabs Studio branding, Unsloth Studio design tokens, 3-column layout (chat history / chatbot / dataset+discovery), pill-tab mode selector, composer with shadow surface, collapsible pipeline stats. Handler logic unchanged.
-- **app.py**: added `allow_custom_value=True` to dataset dropdown to tolerate empty initial state.
-- **app.py**: adapted for Gradio 6.11 — removed `type="messages"` from `gr.Chatbot`, moved `theme`/`css` to `.launch()`, used file path (not data URI) for `avatar_images`.
-- **start_server.sh**: now launches llama-server **and** the Gradio app. Server runs in background, trap handler cleans up on exit, polls `/health` before starting app.py. Sources conda and activates `rag` env.
+- **app.py**: replaced Gradio with FastAPI endpoints and server-sent events for chat, upload/reindex, and arXiv discovery.
+- **web/**: added React single-page app with local chat history, dataset controls, upload/reindex, discovery logs, and streaming pipeline stats.
+- **start_server.sh**: now launches llama-server **and** the React/FastAPI app. Server runs in background, trap handler cleans up on exit, polls `/health` before starting app.py. Sources conda and activates `rag` env.
 - **start_server.sh**: default `--ctx-size` lowered 1048576 → 262144 (256K) to avoid pipeline-parallel compute-buffer OOM on startup.
 - **static/mylabs-logo.png**: added (MyLabs LLC GitHub org avatar, 256×256 JPEG saved as .png).

@@ -6,7 +6,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from config import (
     LLM_BASE_URL, LLM_MODEL, LLM_API_KEY,
-    EMBEDDING_MODEL, RERANKER_MODEL,
+    EMBEDDING_MODEL, EMBEDDING_QUERY_PROMPT_NAME, RERANKER_MODEL,
     VECTORSTORE_DIR,
     RETRIEVAL_K, TOP_K, MAX_TOKENS, TEMPERATURE, TOP_P,
     SYSTEM_PROMPT_RAG_ONLY, SYSTEM_PROMPT_RAG_PLUS_MODEL,
@@ -26,6 +26,12 @@ class RAGEngine:
         # Current active collection
         self.collection = None
         self._dataset_name = None
+
+    def encode_query(self, query: str):
+        """Encode retrieval queries with a model-specific prompt when available."""
+        if EMBEDDING_QUERY_PROMPT_NAME and EMBEDDING_QUERY_PROMPT_NAME in getattr(self.embedder, "prompts", {}):
+            return self.embedder.encode(query, prompt_name=EMBEDDING_QUERY_PROMPT_NAME)
+        return self.embedder.encode(query)
 
     def switch_dataset(self, dataset_name: str):
         """Switch to a different dataset's ChromaDB collection."""
@@ -55,6 +61,37 @@ class RAGEngine:
         except Exception:
             pass
 
+    def all_chunks_by_source(self, dataset_name: str, page_size: int = 1000) -> dict[str, list[dict]]:
+        """Return all indexed chunks for a dataset grouped by source document."""
+        self.switch_dataset(dataset_name)
+        if self.collection is None or self.collection.count() == 0:
+            return {}
+
+        grouped: dict[str, list[dict]] = {}
+        total = self.collection.count()
+        for offset in range(0, total, page_size):
+            result = self.collection.get(
+                limit=page_size,
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+            documents = result.get("documents") or []
+            metadatas = result.get("metadatas") or []
+            for text, meta in zip(documents, metadatas):
+                source = meta.get("source", "unknown")
+                grouped.setdefault(source, []).append(
+                    {
+                        "text": text,
+                        "source": source,
+                        "chunk_index": meta.get("chunk_index", -1),
+                        "page": meta.get("page"),
+                    }
+                )
+
+        for chunks in grouped.values():
+            chunks.sort(key=lambda c: (c.get("chunk_index", -1), c.get("page") or 0))
+        return dict(sorted(grouped.items()))
+
     def retrieve(self, query: str, top_k: int = TOP_K) -> tuple[list[dict], dict]:
         """Retrieve chunks: overfetch with embeddings, then rerank with cross-encoder."""
         if self.collection is None or self.collection.count() == 0:
@@ -64,7 +101,7 @@ class RAGEngine:
         self._last_retrieval_k = RETRIEVAL_K
 
         t0 = time.time()
-        query_embedding = self.embedder.encode(query).tolist()
+        query_embedding = self.encode_query(query).tolist()
         timings["embed"] = time.time() - t0
 
         n_results = min(RETRIEVAL_K, self.collection.count())
@@ -87,6 +124,7 @@ class RAGEngine:
                 "text": doc,
                 "source": meta.get("source", "unknown"),
                 "chunk_index": meta.get("chunk_index", -1),
+                "page": meta.get("page"),
                 "distance": dist,
             })
 
@@ -108,8 +146,10 @@ class RAGEngine:
         """Format retrieved chunks into a context block."""
         parts = []
         for i, c in enumerate(chunks):
+            page = f", page {c['page']}" if c.get("page") else ""
+            citation = f"[source: {c['source']}{page}, chunk {c['chunk_index']}]"
             parts.append(
-                f"[Source: {c['source']} | Chunk {c['chunk_index']} | Relevance: {c['rerank_score']:.2f}]\n{c['text']}"
+                f"{citation} [relevance: {c['rerank_score']:.2f}]\n{c['text']}"
             )
         return "\n\n---\n\n".join(parts)
 

@@ -1,485 +1,336 @@
-# MyLabs Studio — Nemotron-3-Nano 30B-A3B RAG Server
+# MyLabs Studio RAG Server
 
-> **Project root:** `/home/lence/power/super/`
-> **Conda env:** `rag` (Python 3.13) — activate with `conda activate rag`
-> **LLM server:** `llama-server` (TurboQuant fork) on `:8001`
-> **Chat UI:** React/FastAPI "MyLabs Studio" on `:7860`
+> Project root: `/home/lence/power/super/`
+> Conda env: `rag`
+> UI: React/FastAPI on `http://localhost:7860`
+> LLM server: OpenAI-compatible `llama-server` on `http://localhost:8001`
+> Last updated: 2026-05-07
 
----
+MyLabs Studio is a compact local RAG application for research corpora. It runs a FastAPI backend, a no-build React single-page app, per-dataset Chroma vector stores, document ingestion, arXiv discovery, inline source links, and an optional SQLite RDBMS mode for exact SQL-backed questions.
 
-## 1. Orientation (read first if resuming cold)
+## Current Architecture
 
-Local RAG stack running **NVIDIA Nemotron-3-Nano-30B-A3B** (Unsloth Q8_0 GGUF, ~34 GB) split across **2× RTX 3090** (48 GB VRAM total). Documents are chunked, embedded with BGE-base on CPU, stored in **per-dataset ChromaDB collections**, and retrieved with cross-encoder reranking. The chat UI is now a React single-page app served by FastAPI with **MyLabs LLC branding**.
-
-The llama.cpp server is a [TheTom/llama-cpp-turboquant fork](https://github.com/TheTom/llama-cpp-turboquant) that adds `turbo2/3/4` KV-cache compression types. This is what makes giant context windows fit on 24 GB consumer GPUs.
-
-### 30-second mental model
-
-```
-Browser :7860  ──►  React SPA + FastAPI (app.py in rag env)
-                         │
-                         ├─► ChromaDB (./vectorstore/, per-dataset collections)
-                         │   embed: BAAI/bge-base-en-v1.5 (CPU)
-                         │   rerank: BAAI/bge-reranker-base (CPU)
-                         │
-                         └─► OpenAI-compatible API on :8001
-                             llama-server (turboquant build)
-                             Nemotron-3-Nano Q8_0, tensor-split 0.5,0.5
-                             -ctk q8_0 -ctv turbo2, 256K ctx default
+```text
+Browser :7860
+  -> React SPA in web/
+  -> FastAPI backend in app.py
+       -> Dataset files in documents/<dataset>/
+       -> ChromaDB collections in vectorstore/
+       -> Optional SQLite RDBMS in documents/<dataset>/.rdbms/dataset.sqlite
+       -> OpenAI-compatible llama-server :8001
 ```
 
----
+The active model is `Nemotron-3-Nano-30B-A3B-Q8_0.gguf`, launched through the TurboQuant llama.cpp fork. The model has a native 1,048,576 token training context, but the server default is 262,144 tokens because that is the stable startup profile for the 2x RTX 3090 machine.
 
-## 2. Current state of the build (last touched 2026-04-28)
+## Key Files
 
-- ✅ llama.cpp turboquant fork built at `~/llama.cpp-turboquant/build/bin/llama-server`
-- ✅ Mainline llama.cpp fallback at `~/llama.cpp.mainline/llama-server`
-- ✅ Q8_0 GGUF downloaded to `~/models/nemotron-3-nano/`
-- ✅ `rag` conda env with openai, chromadb, sentence-transformers, fastapi, uvicorn, python-multipart, pypdf, python-docx, langchain-text-splitters
-- ✅ `start_server.sh` launches llama-server **and** the React/FastAPI app in one command (conda-activates `rag`, waits for `/health`, traps Ctrl-C to shut down both)
-- ✅ `app.py` exposes API endpoints and SSE streaming for chat, ingestion, reindexing, and arXiv discovery
-- ✅ `web/` contains the React SPA; `static/mylabs-logo.png` is used as header logo and favicon
-- ✅ Default ctx reduced from 1M to **256K** to avoid pipeline-parallel compute-buffer OOM on startup (pass `--ctx-size 1048576` for the full native window if VRAM allows)
-
-### Implementation files (all live in project root)
-
-| File | Role |
+| Path | Purpose |
 |---|---|
-| `app.py` | FastAPI backend — React shell, chat SSE, dataset CRUD, paper discovery, pipeline stats |
-| `web/` | React single-page app assets served on `:7860` |
-| `rag.py` | `RAGEngine` class — retrieve → rerank → generate (streaming) |
-| `ingest.py` | Document ingestion — CLI + `ingest_dataset` / `ingest_dataset_streaming` |
-| `discover.py` | arXiv paper search + download for auto-ingestion |
-| `config.py` | Shared settings (URLs, models, chunking, retrieval K, prompts) |
-| `start_server.sh` | One-command launcher: llama-server + React/FastAPI app (with health check, PID files, logs, trap cleanup) |
-| `stop_server.sh` | Stops both services by PID file and port fallback |
-| `test_rag.py` | Smoke test for the RAG pipeline |
-| `03_collect_data.py` | (related to the parent training project, not RAG) |
-| `static/mylabs-logo.png` | Branding asset |
-| `documents/<name>/` | One folder per dataset (ingested into `rag_<name>` Chroma collection) |
-| `vectorstore/` | ChromaDB persistent storage |
+| `app.py` | FastAPI backend, React static serving, SSE chat, dataset APIs, document text routes, discovery endpoint, SQL RDBMS chat flow |
+| `web/app.js` | React SPA with chat history, dataset controls, discovery controls, inline source links, SQL RDBMS mode |
+| `web/index.html` | React UMD shell and cache-busted asset references |
+| `web/styles.css` | MyLabs Studio UI styling |
+| `rag.py` | `RAGEngine`: Chroma collection switching, retrieval, reranking, streaming generation |
+| `ingest.py` | CLI and streaming document ingestion, PDF page extraction, chunking |
+| `discover.py` | arXiv search, LLM query planning, adaptive query expansion, PDF download/filtering |
+| `rdbms.py` | Dataset-to-SQL layer: normalized SQLite schema, profile generation, SQL validation/execution |
+| `config.py` | Paths, model names, retrieval settings, generation settings, prompts |
+| `start_server.sh` | Starts llama-server and the React/FastAPI app with health checks and PID files |
+| `stop_server.sh` | Stops the UI and llama-server by PID file and port fallback |
+| `test_rag.py` | RAG smoke/accuracy checks |
+| `documents/<dataset>/` | User datasets and generated per-dataset artifacts |
+| `vectorstore/` | Chroma persistent storage |
 
-Always **read the files directly** for code — don't reconstruct from this doc.
+Runtime artifacts such as `documents/`, `vectorstore/`, `.run/`, `logs/`, and generated `.rdbms/` databases are local state. Do not delete user datasets unless explicitly asked.
 
----
+## Running The Stack
 
-## 3. How to run it
-
-### One-command launch (normal path)
+Use the `rag` conda environment for Python commands.
 
 ```bash
-cd ~/power/super
+cd /home/lence/power/super
 ./start_server.sh
 ```
 
-That script:
-1. Kills any stale process on port 8001.
-2. Launches `llama-server` in the background, PID captured.
-3. `trap`s `EXIT INT TERM` to kill the server on Ctrl-C.
-4. Polls `http://localhost:8001/health` for up to 4 min; bails if the server dies.
-5. Sources `conda.sh`, activates the `rag` env, runs `python app.py` in the foreground.
-
-Ctrl-C shuts down **both** the React/FastAPI app and llama-server cleanly.
-
-To stop a background or stuck launch:
+Useful variants:
 
 ```bash
-./stop_server.sh
+./start_server.sh --safe               # turbo3 V-cache, safer quality profile
+./start_server.sh --baseline           # mainline llama.cpp, f16 cache, 8K context
+./start_server.sh --ctx-size 524288    # 512K context
+./start_server.sh --ctx-size 1048576   # full 1M native window, may OOM on startup
+./stop_server.sh                       # stop both UI and llama-server
 ```
 
-Runtime files are written under `.run/`; logs are written under `logs/`.
-
-### Variants
+Health checks:
 
 ```bash
-./start_server.sh --ctx-size 1048576   # full 1M window (may trigger startup OOM-and-retry)
-./start_server.sh --safe               # turbo3 V-cache (higher quality), 256K ctx
-./start_server.sh --baseline           # mainline llama.cpp, f16 cache, 8K ctx
-./start_server.sh --ctx-size 524288    # 512K
-./start_server.sh --autostart on|off   # enable/disable systemd --user service
+curl http://localhost:7860/api/health
+curl http://localhost:8001/health
+curl http://localhost:8001/v1/models
 ```
 
-### Running just the LLM server (no UI)
-
-```bash
-~/llama.cpp-turboquant/build/bin/llama-server \
-    --model ~/models/nemotron-3-nano/Nemotron-3-Nano-30B-A3B-Q8_0.gguf \
-    --alias nemotron-3-nano --n-gpu-layers 99 --tensor-split 0.5,0.5 \
-    -ctk q8_0 -ctv turbo2 --ctx-size 262144 --parallel 1 \
-    --batch-size 2048 --ubatch-size 512 --flash-attn on \
-    --port 8001 --host 0.0.0.0
-```
-
-### Running just the UI
+Run only the UI/backend:
 
 ```bash
 conda activate rag
-cd ~/power/super
 python app.py
 ```
 
-### Ingest docs from the CLI (alt to UI upload)
+## Dataset Operations
+
+Datasets are folders under `documents/`. Dataset names are normalized by `clean_dataset_name()` in `app.py` before use.
+
+CLI examples:
 
 ```bash
 conda activate rag
-cd ~/power/super
-mkdir -p ./documents/CERN
-cp /path/to/papers/* ./documents/CERN/
-python ingest.py CERN              # ingest folder into rag_cern
-python ingest.py CERN --reset      # wipe collection first
-python ingest.py                   # list available datasets
+python ingest.py                         # list datasets
+python ingest.py CERN                    # ingest documents/CERN/
+python ingest.py CERN --reset            # rebuild rag_cern collection
+python ingest.py --all --reset           # rebuild all datasets
 ```
 
-### Smoke tests
+UI operations:
 
-```bash
-curl http://localhost:8001/health
-curl http://localhost:8001/v1/models    # should show "nemotron-3-nano"
-python test_rag.py                       # RAG pipeline smoke test
-```
+- Create dataset
+- Upload and ingest files
+- Re-index dataset
+- Delete dataset
+- Generate cached summary
+- Discover papers from arXiv
+- Generate RDBMS
 
----
+The ingestion path preserves PDF page numbers where extractable. Chunks include `source`, `page`, `chunk_index`, and text metadata.
 
-## 4. Project layout
+## Chat Modes
 
-```
-/home/lence/power/super/
-├── CLAUDE.md              # this file
-├── start_server.sh        # launcher (llama-server + React/FastAPI, PID files + health checks)
-├── stop_server.sh         # stops UI + llama-server by PID/port
-├── config.py              # URLs, model names, chunking/retrieval params, system prompts
-├── rag.py                 # RAGEngine: switch_dataset, retrieve, generate_stream(_direct)
-├── ingest.py              # ingest_dataset, ingest_dataset_streaming, CLI entry
-├── discover.py            # arXiv search + download; title_to_filename helper
-├── app.py                 # FastAPI API + React static serving
-├── web/                   # React SPA assets
-├── test_rag.py            # smoke test
-├── static/
-│   └── mylabs-logo.png    # MyLabs LLC branding (256×256 JPEG)
-├── documents/             # per-dataset subfolders; each → rag_<name> Chroma collection
-│   └── <dataset>/
-└── vectorstore/           # ChromaDB PersistentClient data dir
-```
+The current UI has four modes:
 
-Adjacent: `/home/lence/power/CLAUDE.md` covers the **pretraining pipeline** (unrelated project; don't mix them up).
-
----
-
-## 5. Non-obvious gotchas (must-know before editing)
-
-These are things that cost time to debug in earlier sessions. Respect them.
-
-### 5.1 React/FastAPI UI shape
-
-The browser loads `web/index.html`, `web/app.js`, and `web/styles.css`. The React app has no local build step; it uses production React UMD from a CDN. Backend streaming uses server-sent events from `POST /api/chat/stream`, `POST /api/datasets/{name}/upload`, `POST /api/datasets/{name}/reindex`, and `POST /api/discover`.
-
-### 5.2 Dataset names are normalized
-
-New dataset names are normalized in `app.py` with `clean_dataset_name()`. This prevents path traversal and keeps folder names compatible with the `rag_<dataset>` Chroma collection naming scheme.
-
-### 5.3 Default context is 256K, not 1M
-
-The model's **native training window is 1,048,576 tokens**, but on startup llama.cpp first tries to allocate a **pipeline-parallel compute buffer** (~9.3 GiB at 1M), which OOMs on the 3090s after the Q8_0 weights load. It auto-retries without pipeline parallelism and succeeds with smaller buffers (~3 GB + ~1 GB + ~2 GB host) — so 1M *works* but boots with noisy retry logs. **Default is now 256K** in `start_server.sh`. Pass `--ctx-size 1048576` to opt into 1M.
-
-### 5.4 The UI backend takes ~10-15s to start
-
-It loads BGE-base (embed) + BGE-reranker-base (rerank) on CPU at import time, both of which log `UNEXPECTED embeddings.position_ids` warnings. **These are benign** (sentence-transformers ships a `position_ids` tensor the newer HF architecture doesn't use) — do not "fix" them.
-
-### 5.5 `RAGEngine.collection` can be `None`
-
-After deleting the active dataset, `engine.collection` is set to `None`. The chat handler checks `engine.collection is not None and engine.collection.count() > 0` before retrieving. Preserve that guard if refactoring.
-
-### 5.6 Three chat modes
-
-The mode selector has three values: **"RAG Only"**, **"RAG + Model"**, **"Model Only"**. Only the first two retrieve from the vector store; Model Only bypasses retrieval entirely and calls `engine.generate_stream_direct`. Don't flatten these into a boolean.
-
-### 5.7 Chat history is browser-local
-
-The React app stores conversations in `localStorage` under `mylabs-studio-chats-v2`. Chat name auto-derives from the first 6 words of the first user message.
-
-### 5.8 No mainline llama.cpp at `/usr/local` — use the prebuilt binaries
-
-- Primary: `~/llama.cpp-turboquant/build/bin/llama-server` (supports `-ctv turbo2|3|4`)
-- Fallback: `~/llama.cpp.mainline/llama-server` (f16/q8_0 cache only, used by `--baseline`)
-
-### 5.9 Port already in use errors
-
-If `./start_server.sh` fails with "port in use", run `lsof -ti:7860 :8001 | xargs -r kill` and retry. The launcher auto-frees 8001 at the top; 7860 is owned by `python app.py`.
-
----
-
-## 6. Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│       MyLabs Studio — React + FastAPI (:7860)        │
-│   chat history │ chatbot + composer │ dataset/arXiv  │
-├─────────────────────────────────────────────────────┤
-│                  RAG Orchestrator                    │
-│   query → embed → vector search → rerank → generate  │
-├──────────────────────┬──────────────────────────────┤
-│   Vector Store       │   LLM Inference Server        │
-│   ChromaDB           │   llama-server (turboquant)   │
-│   per-dataset cols   │   Nemotron-3-Nano Q8_0         │
-│   name = rag_<x>     │   2× RTX 3090, tensor split   │
-│   Embed: bge-base    │   OpenAI API on :8001          │
-│   Rerank: bge-base   │   256K ctx (1M optional)      │
-├──────────────────────┴──────────────────────────────┤
-│              Document Ingestion Pipeline             │
-│   PDF/DOCX/TXT/MD → chunk (1024 tok, 128 overlap)   │
-│   → embed (BGE) → upsert to dataset collection      │
-└─────────────────────────────────────────────────────┘
-```
-
-### RAG pipeline stages (for the stats panel)
-
-1. **Embed query** — BGE-base-en-v1.5 on CPU
-2. **Vector search** — top `RETRIEVAL_K=20` candidates by cosine distance
-3. **Rerank** — BGE-reranker-base cross-encoder → top `TOP_K=8`
-4. **LLM generation** — llama-server streaming via OpenAI client
-
-Each stage reports its time; final stats include TTFT, prefill tok/s, decode tok/s, context utilization.
-
-### Per-dataset isolation
-
-Folders under `./documents/` map 1:1 to ChromaDB collections named `rag_<lowercased_name_with_underscores>`. The `CERN` dataset never bleeds into `moon_landing`. The UI's dropdown picks the active collection; `RAGEngine.switch_dataset` swaps `self.collection`.
-
----
-
-## 7. Hardware & model setup (reference, done already)
-
-- **GPUs:** 2× NVIDIA RTX 3090 (24 GB each, 48 GB total)
-- **Model:** `unsloth/Nemotron-3-Nano-30B-A3B-GGUF` variant `Q8_0` (~34 GB single file)
-- **OS:** Ubuntu 24.04
-- **RAM:** ≥64 GB recommended
-
-### System deps (one-time)
-
-```bash
-sudo apt update && sudo apt install -y \
-    build-essential cmake git curl wget libcurl4-openssl-dev \
-    python3 python3-pip python3-venv
-```
-
-### Build llama.cpp (one-time)
-
-```bash
-# Mainline fallback
-git clone https://github.com/ggml-org/llama.cpp ~/llama.cpp.mainline
-cmake ~/llama.cpp.mainline -B ~/llama.cpp.mainline/build \
-    -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON
-cmake --build ~/llama.cpp.mainline/build --config Release -j$(nproc) \
-    --target llama-cli llama-server
-cp ~/llama.cpp.mainline/build/bin/llama-* ~/llama.cpp.mainline/
-
-# TurboQuant fork (primary)
-git clone https://github.com/TheTom/llama-cpp-turboquant ~/llama.cpp-turboquant
-cd ~/llama.cpp-turboquant
-git checkout feature/turboquant-kv-cache
-cmake -B build -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j$(nproc) --target llama-cli llama-server
-```
-
-> If GCC 13+ errors with `invalid use of 'extern' in linkage specification` in `ggml/src/ggml-cpu/ops.cpp`, change `extern "C" GGML_API int turbo3_cpu_wht_group_size;` to `extern "C" int turbo3_cpu_wht_group_size;` and rebuild.
-
-### Download model (one-time)
-
-```bash
-pip install huggingface_hub hf_transfer
-HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
-    unsloth/Nemotron-3-Nano-30B-A3B-GGUF \
-    --local-dir ~/models/nemotron-3-nano --include "*Q8_0*"
-```
-
-### Create the `rag` conda env (one-time)
-
-```bash
-conda create -n rag python=3.13 -y
-conda activate rag
-pip install uv
-uv pip install openai chromadb sentence-transformers fastapi uvicorn python-multipart pypdf \
-    python-docx tiktoken langchain langchain-community langchain-text-splitters
-```
-
----
-
-## 8. llama.cpp server reference
-
-### Critical flags
-
-- `--n-gpu-layers 99` — offload all layers to GPU
-- `--tensor-split 0.5,0.5` — even split across the two 3090s
-- `-ctk q8_0 -ctv turbo2` — asymmetric KV cache. K=q8_0 (precision-critical for attention scoring), V=turbo2 (~6.4× compression for memory)
-- `--ctx-size 262144` — **default 256K** (see §5.3)
-- `--parallel 1` — single-sequence mode; dedicates the full KV cache to one request
-- `--flash-attn on` — memory-efficient attention
-- `--batch-size 2048 --ubatch-size 512` — smaller batch/ubatch → smaller compute buffer → more room for KV cache
-
-### TurboQuant cache types
-
-| Type | Compression | Quality | Use case |
-|---|---|---|---|
-| `turbo4` | 3.8× | Safest | Quality-critical |
-| `turbo3` | 5.1× | Balanced | `--safe` default |
-| `turbo2` | 6.4× | Aggressive | Max-context default |
-
-Why this matters: the Nemotron-Nano hybrid has only **6 of 53 layers using attention** (the rest are Mamba-2 with constant-size state), so KV cache is already cheap per token. `q8_0 K + turbo2 V` costs **~2 KB/token** — a full 1M window is ~2 GB of KV.
-
-### llama-server endpoints
-
-- `GET /health` — liveness check
-- `GET /v1/models` — lists `nemotron-3-nano`
-- `POST /v1/chat/completions` — OpenAI-compatible chat
-- `POST /v1/completions` — OpenAI-compatible text completion
-
-References:
-- Fork: https://github.com/TheTom/llama-cpp-turboquant
-- TurboQuant plus research: https://github.com/TheTom/turboquant_plus
-- Mainline tracking: https://github.com/ggml-org/llama.cpp/discussions/20969
-- Paper: https://arxiv.org/abs/2504.19874
-
----
-
-## 9. OpenAI-compatible API for external agents
-
-llama-server speaks OpenAI's chat-completions wire format. Any agent framework that targets OpenAI can drive Nemotron-3-Nano locally without a shim.
-
-### Connection
-
-| Setting | Value |
+| Mode | Behavior |
 |---|---|
-| Base URL | `http://localhost:8001/v1` |
-| API key | any non-empty string; convention `sk-no-key-required` |
-| Model name | `nemotron-3-nano` (matches `--alias`) |
-| Context | whatever `--ctx-size` was set to (default 256K) |
+| `RAG Only` | Retrieve from the active dataset and answer only from retrieved context |
+| `RAG + Model` | Retrieve context, answer from documents first, and allow model background knowledge with clear distinction |
+| `Model Only` | Bypass retrieval and call the local model directly |
+| `SQL RDBMS` | Convert the question into validated read-only SQLite SQL for the selected dataset RDBMS |
 
-### Env vars (most OpenAI clients)
+Preserve server-sent event streaming from `POST /api/chat/stream`. The frontend expects `stats`, `sources`, `token`, `error`, and `done` events.
+
+## Source Links And Document Text
+
+RAG answers cite source chunks inline. The React app converts citations like:
+
+```text
+[source: paper.pdf, page 3, chunk 12]
+```
+
+into clickable links such as:
+
+```text
+/api/documents/paper.pdf/pages/3?chunk=12
+```
+
+Important document routes:
+
+- `GET /api/documents/{source}/pages/{page}?chunk=N`
+- `GET /api/documents/{source}/text?chunk=N`
+- Dataset-scoped equivalents under `/api/datasets/{name}/documents/...`
+
+The document view highlights cited chunk text in yellow. If the requested page is stale or no longer exists in the current PDF, the route now returns an HTML fallback showing the full extracted document text instead of JSON `404`. If the chunk still exists under another page, it still tries to highlight it.
+
+## SQL RDBMS Feature
+
+`Gen RDBMS` creates:
+
+```text
+documents/<dataset>/.rdbms/dataset.sqlite
+documents/<dataset>/.rdbms/profile.json
+```
+
+The SQLite schema is normalized around:
+
+- `documents`
+- `pages`
+- `chunks`
+- `terms`
+- `chunk_terms`
+- `measurements`
+- `citations`
+- `sql_audit`
+
+SQL mode behavior:
+
+1. Loads the generated schema/profile.
+2. Uses a strict SQL compiler prompt.
+3. Extracts SQL from model output, including malformed `<think>` wrappers.
+4. Validates read-only SQL only.
+5. Dry-checks with SQLite `EXPLAIN QUERY PLAN`.
+6. Repairs invalid SQL once.
+7. Falls back to conservative evidence-search SQL if compilation fails.
+8. Streams the generated SQL before execution.
+9. Executes the query and returns exact rows.
+
+Safety constraints:
+
+- Only `SELECT` or `WITH`.
+- No `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `ATTACH`, `PRAGMA`, etc.
+- No multi-statement SQL.
+- Read-only SQLite connection for query execution.
+
+For legal, scientific, or medical data, prefer returning `source_name`, `page_number`, `chunk_index`, `source_url`, and evidence text so results stay source-grounded.
+
+## arXiv Discovery
+
+Discovery is no longer a narrow literal query list. The current pipeline is:
+
+1. Ask the local LLM to create a topic-specific arXiv query plan.
+2. Force the first query to be the user's exact topic.
+3. Include acronym expansions, synonyms, broader/narrower scientific terms, methods, treatments, measurements, legal concepts, datasets, or mechanisms as appropriate.
+4. Search arXiv with conservative pacing.
+5. After the first result batch, extract important title/abstract terms and append adaptive follow-up queries when there is room.
+6. Score papers using the whole query plan, not just the original phrase.
+7. Download PDFs, verify extractable text quality, then ingest downloaded documents.
+
+The activity log shows:
+
+- `Discovery query plan: ...`
+- `Expanded query plan: ...`
+- `Adaptive follow-up queries: ...` when generated
+- arXiv cooldown and retry messages
+
+Defaults:
+
+- `DiscoveryRequest.max_papers = 15`
+- `DiscoveryRequest.num_queries = 8`
+- UI query count max is 12
+- `RAG_DISCOVER_ARXIV_DELAY` defaults to 7 seconds
+- 429 backoff is intentionally conservative
+
+## Model And Context
+
+Model path:
+
+```text
+/home/lence/models/nemotron-3-nano/Nemotron-3-Nano-30B-A3B-Q8_0.gguf
+```
+
+Current launch profile:
+
+```text
+--ctx-size 262144
+-ctk q8_0
+-ctv turbo2
+--parallel 1
+--batch-size 2048
+--ubatch-size 512
+--flash-attn on
+--tensor-split 0.5,0.5
+```
+
+The model metadata reports `n_ctx_train = 1048576`, but `llama-server` currently runs `n_ctx = 262144` by default. `config.py` still exposes `LLM_CTX_SIZE = 1048576` for display/context accounting, so when exact running context matters, check `http://localhost:8001/props` or the llama-server log.
+
+## API Endpoints
+
+Core:
+
+- `GET /`
+- `GET /api/health`
+- `GET /api/bootstrap`
+- `GET /api/datasets`
+- `POST /api/datasets`
+- `POST /api/datasets/select`
+- `DELETE /api/datasets/{name}`
+
+Ingestion/discovery:
+
+- `POST /api/datasets/{name}/upload`
+- `POST /api/datasets/{name}/reindex`
+- `GET /api/datasets/{name}/summary`
+- `POST /api/datasets/{name}/summarize`
+- `POST /api/discover`
+
+RDBMS:
+
+- `GET /api/datasets/{name}/rdbms`
+- `POST /api/datasets/{name}/rdbms/generate`
+
+Chat/documents:
+
+- `POST /api/chat/stream`
+- `GET /api/documents/{source}/pages/{page}`
+- `GET /api/documents/{source}/text`
+- `GET /api/datasets/{name}/documents/{source}/pages/{page}`
+- `GET /api/datasets/{name}/documents/{source}/text`
+
+## Frontend Notes
+
+The React app is plain `React.createElement` with no build step. It is served from `web/` and loaded through CDN React UMD scripts.
+
+Local browser chat state:
+
+```text
+localStorage key: mylabs-studio-chats-v2
+```
+
+The frontend defensively stringifies old object-shaped chat content and sanitizes chat history before sending it to the backend. This prevents `[object Object]` responses from malformed persisted history.
+
+When editing `web/app.js` or `web/styles.css`, bump the query-string cache version in `web/index.html`.
+
+## Testing And Validation
+
+Light checks:
 
 ```bash
-export OPENAI_BASE_URL="http://localhost:8001/v1"
-export OPENAI_API_KEY="sk-no-key-required"
-export OPENAI_MODEL="nemotron-3-nano"
+python -m py_compile app.py discover.py ingest.py rag.py rdbms.py config.py
+node --check web/app.js
+git diff --check
 ```
 
-### curl smoke test
+Runtime checks:
 
 ```bash
-curl http://localhost:8001/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"nemotron-3-nano","messages":[{"role":"user","content":"Say hello."}],"max_tokens":32}'
-```
-
-### Framework pointers
-
-- **LangChain:** `ChatOpenAI(base_url="http://localhost:8001/v1", api_key="sk-no-key-required", model="nemotron-3-nano")`
-- **LlamaIndex:** `OpenAILike(api_base="http://localhost:8001/v1", api_key="sk-no-key-required", model="nemotron-3-nano", is_chat_model=True)`
-- **AutoGen:** `{"base_url": "http://localhost:8001/v1", "api_key": "sk-no-key-required", "model": "nemotron-3-nano"}`
-
-### Caveats
-
-- **Single-request.** llama.cpp is not vLLM — a second concurrent request queues.
-- **Prompt caching is implicit.** Identical prefixes hit the KV cache; keep system prompts stable.
-- **Tool/function calling** is supported via the model's chat template. Watch the tool-schema size against the ctx budget.
-- **LAN access.** Server binds `0.0.0.0:8001`. **No auth.** Only expose on trusted networks.
-
----
-
-## 10. UI design system — MyLabs Studio
-
-The UI is a React single-page app served by FastAPI from `app.py`. It keeps the MyLabs/Unsloth-inspired visual language but removes Gradio runtime overhead and uses server-sent events for low-latency streaming.
-
-### Branding
-
-- **Header logo & favicon:** `static/mylabs-logo.png` (MyLabs LLC avatar).
-- **Header text:** "MyLabs Studio — Nemotron-3-Nano RAG · React SPA"
-- **Status pill:** green "Online" indicator, amber "Working" while streaming or ingesting
-- **Context chip:** shows `<N>K ctx` in the header
-
-### Design tokens (in `web/styles.css`)
-
-```css
---bg: #141513;
---panel: #1e211d;
---panel-2: #252a24;
---line: #3d463b;
---text: #f5f3ea;
---muted: #a9b0a2;
---green: #41d196;
-```
-
-Fonts loaded from Google Fonts: **Manrope** (body/headings) and **JetBrains Mono** (stats/logs).
-
-### Layout
-
-```
-┌─── HEADER (logo + title + ctx chip + Online pill) ─────────────┐
-│                                                                 │
-│  LEFT          │      MAIN                    │  RIGHT          │
-│  (scale 1)     │      (scale 4)               │  (scale 2)      │
-│                │                              │                 │
-│  + New Chat    │  Streaming chat transcript   │  Dataset        │
-│  Conversations │                              │    dropdown     │
-│  · chat 1      │  Mode pills: RAG / R+M / M   │    info box     │
-│  · chat 2      │                              │  ▸ New Dataset  │
-│  · …           │  Composer (textarea + Send)  │  ▾ Upload Docs  │
-│                │                              │    (drag-drop)  │
-│  Delete Chat   │  ▸ Pipeline stats            │  ▸ Discover     │
-│                │                              │    (arXiv)      │
-└────────────────┴──────────────────────────────┴─────────────────┘
-```
-
-### API endpoints
-
-- `GET /api/bootstrap` — initial app state, datasets, active dataset, UI metadata.
-- `POST /api/chat/stream` — SSE chat streaming with pipeline stats and sources.
-- `POST /api/datasets`, `POST /api/datasets/select`, `DELETE /api/datasets/{name}` — dataset CRUD.
-- `POST /api/datasets/{name}/upload`, `POST /api/datasets/{name}/reindex` — SSE ingestion progress.
-- `POST /api/discover` — SSE arXiv discovery, download, and ingestion progress.
-
----
-
-## 11. Tuning guide
-
-| Problem | Fix |
-|---|---|
-| llama-server OOM on startup | Default is already 256K. Further reduce `--ctx-size` (e.g. 131072), or fall back to `--baseline` (8K f16). |
-| Slow generation | `nvidia-smi`; if one GPU maxes, adjust `--tensor-split` (e.g. `0.45,0.55`). |
-| Bad retrieval quality | Raise `RETRIEVAL_K` (overfetch for the reranker) or bump `CHUNK_OVERLAP`. |
-| Reranker too slow | Lower `RETRIEVAL_K` — rerank cost ≈ linear in K. |
-| Hallucinations | Lower `TEMPERATURE` to 0.3, raise `TOP_K` to 12, use `SYSTEM_PROMPT_RAG_ONLY` in config.py. |
-| Cross-dataset bleed | Datasets are collection-isolated — check which `rag_<name>` the UI is pointed at. |
-| Want full 1M ctx | `./start_server.sh --ctx-size 1048576` (accepts the startup OOM-retry noise). |
-| TurboQuant quality issues | `-ctv turbo4` (3.8×, safest) or `--baseline`. |
-| React UI does not load | Check browser network access to React CDN or vendor React locally in `web/`. |
-| Port 7860 or 8001 in use | `./stop_server.sh` then re-run `./start_server.sh`. |
-
----
-
-## 12. Monitoring
-
-```bash
-# GPU utilization + VRAM
-watch -n 1 nvidia-smi
-
-# llama-server health
+curl http://localhost:7860/api/health
 curl http://localhost:8001/health
-
-# Chunk counts per dataset
-conda activate rag
-python -c "
-import chromadb
-db = chromadb.PersistentClient(path='./vectorstore')
-for c in db.list_collections():
-    print(f'{c.name}: {c.count()} chunks')
-"
+curl http://localhost:8001/props | head -c 1000
+python test_rag.py
 ```
 
----
+RDBMS smoke path:
 
-## 13. History of recent changes (this session)
+1. Select a dataset.
+2. Click `Gen RDBMS`.
+3. Switch chat mode to `SQL RDBMS`.
+4. Ask a question.
+5. Confirm generated SQL appears inline before results.
 
-- **app.py**: replaced Gradio with FastAPI endpoints and server-sent events for chat, upload/reindex, and arXiv discovery.
-- **web/**: added React single-page app with local chat history, dataset controls, upload/reindex, discovery logs, and streaming pipeline stats.
-- **start_server.sh**: now launches llama-server **and** the React/FastAPI app. Server runs in background, trap handler cleans up on exit, polls `/health` before starting app.py. Sources conda and activates `rag` env.
-- **start_server.sh**: default `--ctx-size` lowered 1048576 → 262144 (256K) to avoid pipeline-parallel compute-buffer OOM on startup.
-- **static/mylabs-logo.png**: added (MyLabs LLC GitHub org avatar, 256×256 JPEG saved as .png).
+Document-link smoke path:
+
+```bash
+curl -s -o /tmp/doc.html -w '%{http_code} %{content_type}\n' \
+  'http://localhost:7860/api/documents/<source.pdf>/pages/<page>?chunk=<chunk>'
+```
+
+Expected result is `200 text/html` for valid pages and stale-page fallbacks.
+
+## Operational Gotchas
+
+- Use `./stop_server.sh` before restarting services.
+- Do not reset/delete `documents/` or `vectorstore/` unless the user explicitly asks.
+- `RAGEngine.collection` can be `None`; preserve guards around `engine.collection`.
+- Existing chat modes plus `SQL RDBMS` should remain distinct.
+- arXiv rate limits are real; avoid lowering pacing unless explicitly needed.
+- The embedding/reranker load warnings about `position_ids` are benign.
+- The UI has no bundler. Do not add a frontend build chain unless requested.
+- The app may have dirty runtime data even when code is clean. Keep commits focused on source/config/docs.
+
+## Git Notes
+
+Recent integrated commit:
+
+```text
+85ac157 Add MyLabs Studio RAG workflows
+```
+
+That commit introduced the React/FastAPI workflow, RDBMS SQL mode, generalized discovery planning, source-link handling, launcher/stop scripts, and local artifact ignore rules.
+
+Use short imperative commit messages. For UI/API changes, mention test commands and any model/dataset prerequisites in PR notes.
